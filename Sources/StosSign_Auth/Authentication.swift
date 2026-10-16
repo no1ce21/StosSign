@@ -4,6 +4,9 @@
 //
 //  Created by Stossy11 on 18/12/2025.
 //
+//  PATCHED (untested): port of the AltSign change "Handle 2FA codes that Apple sends on its own".
+//  Search for "// CHANGED" to see every modification.
+//
 
 import Foundation
 import StosSign_API
@@ -20,27 +23,48 @@ public final class Authentication {
     
     public static let dateFormatter = ISO8601DateFormatter()
     
-    public static func authenticate(
-        appleID unsanitizedAppleID: String,
-        password: String,
-        anisetteData: AnisetteData,
-        smsClientInfo: String? = nil,
-        verificationHandler: ((@escaping (String?) -> Void) async -> Void)? = nil
-    ) async throws -> (Account, AppleAPISession) {
-        let sanitizedAppleID = unsanitizedAppleID.lowercased()
-        let macOSClientInfo: AnisetteData = .init(machineID: anisetteData.machineID, oneTimePassword: anisetteData.oneTimePassword, localUserID: anisetteData.localUserID, routingInfo: anisetteData.routingInfo, deviceUniqueIdentifier: anisetteData.deviceUniqueIdentifier, deviceSerialNumber: anisetteData.deviceSerialNumber, deviceDescription: smsClientInfo ?? anisetteData.deviceDescription, date: anisetteData.date, locale: anisetteData.locale, timeZone: anisetteData.timeZone)
-        
-        print(anisetteData.deviceDescription)
-        print(macOSClientInfo.deviceDescription)
-        
-        let clientDictionary: [String: Any] = [
+    // CHANGED: small helpers ------------------------------------------------------------
+    
+    /// Same data, but with a different client info string (used for the SMS / macOS client info override).
+    private static func applyingClientInfo(_ clientInfo: String?, to data: AnisetteData) -> AnisetteData {
+        return AnisetteData(
+            machineID: data.machineID,
+            oneTimePassword: data.oneTimePassword,
+            localUserID: data.localUserID,
+            routingInfo: data.routingInfo,
+            deviceUniqueIdentifier: data.deviceUniqueIdentifier,
+            deviceSerialNumber: data.deviceSerialNumber,
+            deviceDescription: clientInfo ?? data.deviceDescription,
+            date: data.date,
+            locale: data.locale,
+            timeZone: data.timeZone
+        )
+    }
+    
+    /// Apple rejects one-time passwords that were already used, so ask for fresh anisette data when a refresh handler exists.
+    private static func refreshedAnisetteData(
+        _ current: AnisetteData,
+        using handler: (() async throws -> AnisetteData)?
+    ) async throws -> AnisetteData {
+        guard let handler = handler else { return current }
+        return try await handler()
+    }
+    
+    /// Optional: drop locale keywords such as "@rg=skzzzz". Apple's 2FA endpoints can answer HTTP 500 when they are present.
+    private static func normalizedLocaleIdentifier(_ identifier: String) -> String {
+        return String(identifier.prefix { $0 != "@" })
+    }
+    
+    private static func makeClientDictionary(anisetteData: AnisetteData) -> [String: Any] {
+        let locale = normalizedLocaleIdentifier(Locale.current.identifier)
+        return [
             "bootstrap": true,
             "icscrec": true,
             "pbe": false,
             "prkgen": true,
             "svct": "iCloud",
-            "loc": Locale.current.identifier,
-            "X-Apple-Locale": Locale.current.identifier,
+            "loc": locale,
+            "X-Apple-Locale": locale,
             "X-Apple-I-MD": anisetteData.oneTimePassword,
             "X-Apple-I-MD-M": anisetteData.machineID,
             "X-Mme-Device-Id": anisetteData.deviceUniqueIdentifier,
@@ -50,6 +74,33 @@ public final class Authentication {
             "X-Apple-I-Client-Time": dateFormatter.string(from: anisetteData.date),
             "X-Apple-I-TimeZone": TimeZone.current.abbreviation() ?? "PST"
         ]
+    }
+    
+    // -----------------------------------------------------------------------------------
+    
+    public static func authenticate(
+        appleID unsanitizedAppleID: String,
+        password: String,
+        anisetteData: AnisetteData,
+        smsClientInfo: String? = nil,
+        verificationHandler: ((@escaping (String?) -> Void) async -> Void)? = nil,
+        anisetteDataRefreshHandler: (() async throws -> AnisetteData)? = nil // CHANGED: new, optional, last so existing callers keep working
+    ) async throws -> (Account, AppleAPISession) {
+        let sanitizedAppleID = unsanitizedAppleID.lowercased()
+        let macOSClientInfo = applyingClientInfo(smsClientInfo, to: anisetteData) // CHANGED: uses helper, same result as before
+        
+        // CHANGED: refresh closure that keeps the client info override
+        var refreshMacOSClientInfo: (() async throws -> AnisetteData)? = nil
+        if let handler = anisetteDataRefreshHandler {
+            refreshMacOSClientInfo = {
+                return Authentication.applyingClientInfo(smsClientInfo, to: try await handler())
+            }
+        }
+        
+        print(anisetteData.deviceDescription)
+        print(macOSClientInfo.deviceDescription)
+        
+        let clientDictionary = makeClientDictionary(anisetteData: anisetteData) // CHANGED: moved into helper
         
         let context = GSAContext(username: sanitizedAppleID, password: password)
         guard let publicKey = context.start() else {
@@ -130,8 +181,14 @@ public final class Authentication {
         
         context.dsid = dsid
         
+        // CHANGED: since October 2026 Apple often sends the code to trusted devices on its own.
+        // It then answers with hsc 409 and no "au" value instead of "trustedDeviceSecondaryAuth".
         let authType = statusDictionary["au"] as? String
-        switch authType {
+        let statusCode = statusDictionary["hsc"] as? Int
+        let isCodeAlreadySent = (authType ?? "").isEmpty && statusCode == 409
+        let effectiveAuthType: String? = isCodeAlreadySent ? "trustedDeviceSecondaryAuth" : authType
+        
+        switch effectiveAuthType {
         case "trustedDeviceSecondaryAuth":
             guard let verificationHandler = verificationHandler else {
                 throw AppleAPIError.requiresTwoFactorAuthentication
@@ -141,15 +198,21 @@ public final class Authentication {
                 dsid: dsid,
                 idmsToken: idmsToken,
                 anisetteData: macOSClientInfo,
+                isCodeAlreadySent: isCodeAlreadySent, // CHANGED
+                anisetteDataRefresh: refreshMacOSClientInfo, // CHANGED
                 verificationHandler: verificationHandler
             )
+            
+            // CHANGED: the first one-time password was already used, so sign in again with a fresh one
+            let freshAnisetteData = try await refreshedAnisetteData(anisetteData, using: anisetteDataRefreshHandler)
             
             return try await authenticate(
                 appleID: unsanitizedAppleID,
                 password: password,
-                anisetteData: anisetteData,
+                anisetteData: freshAnisetteData,
                 smsClientInfo: smsClientInfo,
-                verificationHandler: verificationHandler
+                verificationHandler: verificationHandler,
+                anisetteDataRefreshHandler: anisetteDataRefreshHandler
             )
             
         case "secondaryAuth":
@@ -164,12 +227,16 @@ public final class Authentication {
                 verificationHandler: verificationHandler
             )
             
+            // CHANGED: fresh one-time password for the second sign-in
+            let freshAnisetteData = try await refreshedAnisetteData(anisetteData, using: anisetteDataRefreshHandler)
+            
             return try await authenticate(
                 appleID: unsanitizedAppleID,
                 password: password,
-                anisetteData: anisetteData,
+                anisetteData: freshAnisetteData,
                 smsClientInfo: smsClientInfo,
-                verificationHandler: verificationHandler
+                verificationHandler: verificationHandler,
+                anisetteDataRefreshHandler: anisetteDataRefreshHandler
             )
             
         default:
@@ -186,11 +253,14 @@ public final class Authentication {
                 throw AppleAPIError.authenticationHandshakeFailed
             }
             
+            // CHANGED: fresh one-time password for the app token request (no-op without a refresh handler)
+            let tokenAnisetteData = try await refreshedAnisetteData(anisetteData, using: anisetteDataRefreshHandler)
+            
             let tokenParameters: [String: Any] = [
                 "app": [app],
                 "c": c,
                 "checksum": checksum,
-                "cpd": clientDictionary,
+                "cpd": makeClientDictionary(anisetteData: tokenAnisetteData), // CHANGED
                 "o": "apptokens",
                 "t": idmsToken,
                 "u": dsid
@@ -201,13 +271,13 @@ public final class Authentication {
                 app: app,
                 parameters: tokenParameters,
                 context: context,
-                anisetteData: anisetteData
+                anisetteData: tokenAnisetteData // CHANGED
             )
             
             let session = AppleAPISession(
                 dsid: dsid,
                 authToken: token,
-                anisetteData: anisetteData
+                anisetteData: tokenAnisetteData // CHANGED
             )
             
             let account = try await AppleAPI.shared.fetchAccount(session: session)
@@ -221,13 +291,21 @@ public final class Authentication {
         anisetteData: AnisetteData,
         smsClientInfo: String? = nil,
         verificationHandler: ((@escaping (String?) -> Void) -> Void)? = nil,
+        anisetteDataRefreshHandler: (() async throws -> AnisetteData)? = nil, // CHANGED: new, optional
         completionHandler: @escaping (Account?, AppleAPISession?, Error?) -> Void
     ) {
         Task {
             do {
-                let success = try await authenticate(appleID: unsanitizedAppleID, password: password, anisetteData: anisetteData, smsClientInfo: smsClientInfo) { veri in
-                    verificationHandler?(veri)
-                }
+                let success = try await authenticate(
+                    appleID: unsanitizedAppleID,
+                    password: password,
+                    anisetteData: anisetteData,
+                    smsClientInfo: smsClientInfo,
+                    verificationHandler: { veri in
+                        verificationHandler?(veri)
+                    },
+                    anisetteDataRefreshHandler: anisetteDataRefreshHandler // CHANGED
+                )
                 
                 completionHandler(success.0, success.1, nil)
             } catch {
@@ -254,7 +332,7 @@ public final class Authentication {
             "Content-Type": "text/x-xml-plist",
             "X-MMe-Client-Info": anisetteData.deviceDescription,
             "Accept": "*/*",
-            "User-Agent": "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.dt.Xcode/26.0)",
+            "User-Agent": "akd/1.0 CFNetwork/808.1.4",
             "Connection": "close"
         ]
         
@@ -327,7 +405,7 @@ public final class Authentication {
             "X-Mme-Device-Id": anisetteData.deviceUniqueIdentifier,
             "X-MMe-Client-Info": anisetteData.deviceDescription,
             "X-Apple-I-Client-Time": dateFormatter.string(from: anisetteData.date),
-            "X-Apple-Locale": anisetteData.locale.identifier,
+            "X-Apple-Locale": normalizedLocaleIdentifier(anisetteData.locale.identifier), // CHANGED: optional locale clean-up
             "X-Apple-I-TimeZone": anisetteData.timeZone.abbreviation() ?? "PST",
             "Connection": "close"
         ]
@@ -381,19 +459,25 @@ public final class Authentication {
         dsid: String,
         idmsToken: String,
         anisetteData: AnisetteData,
+        isCodeAlreadySent: Bool = false, // CHANGED: new
+        anisetteDataRefresh: (() async throws -> AnisetteData)? = nil, // CHANGED: new
         verificationHandler: @escaping (@escaping (String?) -> Void) async -> Void
     ) async throws {
         let requestURL = URL(string: "https://gsa.apple.com/auth/verify/trusteddevice")!
         let verifyURL = URL(string: "https://gsa.apple.com/grandslam/GsService2/validate")!
         
-        let request = makeTwoFactorCodeRequest(
-            url: requestURL,
-            dsid: dsid,
-            idmsToken: idmsToken,
-            anisetteData: anisetteData
-        )
-        
-        let _ = try? await AppleAPI.shared.session.data(for: request)
+        // CHANGED: if Apple already pushed a code, do not ask for another one,
+        // because that would invalidate the code that was just sent.
+        if !isCodeAlreadySent {
+            let request = makeTwoFactorCodeRequest(
+                url: requestURL,
+                dsid: dsid,
+                idmsToken: idmsToken,
+                anisetteData: anisetteData
+            )
+            
+            let _ = try? await AppleAPI.shared.session.data(for: request)
+        }
         
         
         let verificationCode = try await withCheckedThrowingContinuation { continuation in
@@ -408,11 +492,17 @@ public final class Authentication {
             throw AppleAPIError.requiresTwoFactorAuthentication
         }
         
+        // CHANGED: typing the code can take longer than the one-time password stays valid, so use fresh anisette data
+        var verifyAnisetteData = anisetteData
+        if let refresh = anisetteDataRefresh {
+            verifyAnisetteData = try await refresh()
+        }
+        
         var verifyRequest = makeTwoFactorCodeRequest(
             url: verifyURL,
             dsid: dsid,
             idmsToken: idmsToken,
-            anisetteData: anisetteData
+            anisetteData: verifyAnisetteData
         )
         verifyRequest.allHTTPHeaderFields?["security-code"] = code
         
